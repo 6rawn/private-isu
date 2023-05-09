@@ -180,7 +180,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `id` DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
@@ -386,7 +386,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, fmt.Sprintf("SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` NOT IN (SELECT DISTINCT `id` FROM `users` where del_flg !=0) ORDER BY id DESC LIMIT %v", postsPerPage))
 	if err != nil {
 		log.Print(err)
 		return
