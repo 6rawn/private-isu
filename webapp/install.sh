@@ -6,6 +6,7 @@ ALP_URL="https://github.com/tkuchiki/alp/releases/download/v1.0.12/alp_linux_amd
 DOWNLOAD_AB="sudo apt-get install -y apache2-utils"
 DOWNLOAD_MYSQL_CLIENT="sudo apt-get install -y mysql-client"
 DOWNLOAD_DSTAT="sudo apt-get install -y dstat"
+PT_QUERY_DIGEST_URL="percona.com/get/pt-query-digest"
 
 if [[ "$UNAME" == *Darwin* ]];
 then
@@ -62,7 +63,29 @@ download_k6() {
 
     if [[ "$UNAME" == *Darwin* ]];
     then
-        brew instsall k6
+        brew install k6
+    fi
+}
+
+download_pt_query_digest() {
+    if [[ ! -f pt-query-digest ]];
+    then
+        curl -LO "${PT_QUERY_DIGEST_URL}"
+        chmod +x pt-query-digest
+    fi
+}
+
+download_watch() {
+    if [[ ! -f watch ]];
+    then
+        brew install watch
+    fi
+}
+
+download_gsed() {
+    if [[ ! -f gsed ]];
+    then
+        brew install gsed
     fi
 }
 
@@ -70,8 +93,15 @@ download_alp
 download_ab
 download_mysql_client
 download_k6
+download_pt_query_digest
 
 if [[ "$UNAME" == *Linux* ]];
 then
     download_dstat
+fi
+
+if [[ "$UNAME" == *Darwin* ]];
+then
+    download_watch
+    download_gsed
 fi

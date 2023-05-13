@@ -40,7 +40,20 @@ mysqldumpslow:
 
 .PHONY: dstat
 dstat:
-	dstat --cpu
+	if [[ "`uname -a`" == *"Linus"* ]]; then dstat --cpu; fi
+
+.PHONY: stats
+stats:
+	docker stats
+
+.PHONY: pt-query-digest
+pt-query-digest:
+	./pt-query-digest ./logs/mysql/mysql-slow.log | tee digest_$(shell date +%Y%m%d%H%M).txt
+
+.PHONY: query-digester
+query-digester:
+	./query-digester
+
 
 .PHONY: requirements
 requirements:
