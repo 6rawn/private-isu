@@ -1,6 +1,6 @@
 #!/bin/bash
 
-mysql_container=$(docker ps | grep $(docker-compose ps | grep mysql | cut -f 1 -d ' ') | cut -f 1 -d ' ')
+mysql_container=$(docker ps | grep $(docker compose ps | grep mysql | cut -f 1 -d ' ') | cut -f 1 -d ' ')
 
 TMP_SLOW_QUERY_LOG=/var/log/mysql/slow_query_$(date +%Y%m%d%H%M).digest
 echo "Write latest sloq_query_log to ${TMP_SLOW_QUERY_LOG} from now during 30s."
