@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -25,8 +26,9 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db             *sqlx.DB
+	store          *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
@@ -71,7 +73,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -171,6 +173,75 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+func getUsersFromDB(userIds []string) ([]User, error) {
+	users := make([]User, 0, len(userIds))
+
+	err := db.Select(&users, fmt.Sprintf("SELECT * FROM users WHERE id IN (%s)", strings.Join(userIds, ", ")))
+	if err != nil {
+		return nil, err
+	}
+
+	return users, nil
+}
+
+func getUsersFromCache(userIds []string) (map[string]User, error) {
+	users := map[string]User{}
+	userMap, err := memcacheClient.GetMulti(userIds)
+	if err != nil {
+		return nil, err
+	}
+
+	notFoundUserIds := []string{}
+	for _, userId := range userIds {
+		rawUser, ok := userMap[userId]
+		if !ok {
+			notFoundUserIds = append(notFoundUserIds, userId)
+			continue
+		}
+
+		user := &User{}
+		err := json.Unmarshal(rawUser.Value, &user)
+		if err != nil {
+			return nil, err
+		}
+		users[userId] = *user
+	}
+
+	if len(notFoundUserIds) > 0 {
+		_users, err := getUsersFromDB(notFoundUserIds)
+		if err != nil {
+			return nil, err
+		}
+		for _, user := range _users {
+			rawUser, err := json.Marshal(&user)
+			if err != nil {
+				return nil, err
+			}
+
+			key := strconv.Itoa(user.ID)
+			err = memcacheClient.Set(&memcache.Item{
+				Key:   key,
+				Value: rawUser,
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			users[strconv.Itoa(user.ID)] = user
+		}
+	}
+
+	return users, nil
+}
+
+func getUsers(userIds []string) (map[string]User, error) {
+	users, err := getUsersFromCache(userIds)
+	if err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
@@ -180,7 +251,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `id` DESC"
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
@@ -190,11 +261,24 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
+		postUserId := strconv.Itoa(p.UserID)
+		userIds := []string{postUserId}
 		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+			userIds = append(userIds, strconv.Itoa(comments[i].UserID))
+		}
+
+		users, err := getUsers(userIds)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := 0; i < len(comments); i++ {
+			userId := strconv.Itoa(comments[i].UserID)
+			user, ok := users[userId]
+			if !ok {
+				return nil, fmt.Errorf("no found user %s", userId)
 			}
+			comments[i].User = user
 		}
 
 		// reverse
@@ -204,10 +288,11 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
+		u, ok := users[postUserId]
+		if !ok {
 			return nil, err
 		}
+		p.User = u
 
 		p.CSRFToken = csrfToken
 
@@ -386,7 +471,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, fmt.Sprintf("SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` NOT IN (SELECT DISTINCT `id` FROM `users` where del_flg !=0) ORDER BY id DESC LIMIT %v", postsPerPage))
+	err := db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM posts WHERE user_id IN (SELECT id FROM users WHERE del_flg = 0) ORDER BY created_at DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
