@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -74,6 +75,8 @@ func init() {
 		memdAddr = "localhost:11211"
 	}
 	memcacheClient = memcache.New(memdAddr)
+	memcacheClient.Timeout = 1000 * time.Millisecond // 1s
+	memcacheClient.MaxIdleConns = 100
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -641,7 +644,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -699,15 +702,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mime := ""
+	ext := ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
+			ext = "jpg"
 		} else if strings.Contains(contentType, "png") {
 			mime = "image/png"
+			ext = "png"
 		} else if strings.Contains(contentType, "gif") {
 			mime = "image/gif"
+			ext = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -733,12 +740,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -748,6 +754,20 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	pid, err := result.LastInsertId()
 	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	fileName := fmt.Sprintf("../public/image/%d.%v", pid, ext)
+	imageFile, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer imageFile.Close()
+
+	bufferedWriter := bufio.NewWriter(imageFile)
+	if _, err = bufferedWriter.Write(filedata); err != nil {
 		log.Print(err)
 		return
 	}
