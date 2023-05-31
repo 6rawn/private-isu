@@ -1,4 +1,3 @@
-{{ define "content" }}
 <div class="isu-submit">
   <form method="post" action="/" enctype="multipart/form-data">
     <div class="isu-form">
@@ -19,10 +18,9 @@
   </form>
 </div>
 
-{{ template "posts.html" .Posts }}
+{{ template "posts" .Posts }}
 
 <div id="isu-post-more">
   <button id="isu-post-more-btn">もっと見る</button>
   <img class="isu-loading-icon" src="/img/ajax-loader.gif">
 </div>
-{{ end }}

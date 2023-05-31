@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bufio"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"html/template"
-	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -18,18 +15,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
-	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
-	"github.com/go-chi/chi/v5"
+	goMemcache "github.com/bradfitz/gomemcache/memcache"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/gorilla/sessions"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/session"
+	"github.com/gofiber/template/html"
 	"github.com/jmoiron/sqlx"
 )
 
 var (
 	db             *sqlx.DB
-	store          *gsm.MemcacheStore
-	memcacheClient *memcache.Client
+	sessionStore   *session.Store
+	memcacheClient *goMemcache.Client
 )
 
 const (
@@ -74,11 +71,17 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient = memcache.New(memdAddr)
-	memcacheClient.Timeout = 1000 * time.Millisecond // 1s
+	memcacheClient = goMemcache.New(memdAddr)
+	memcacheClient.Timeout = 5000 * time.Millisecond // 1s
 	memcacheClient.MaxIdleConns = 100
-	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	// cacheStorage := memcache.New(memcache.Config{
+	// 	Servers: memdAddr,
+	// })
+	sessionStore = session.New(session.Config{
+		// Storage:   cacheStorage,
+		KeyLookup: "cookie:isuconp-go.session",
+	})
 }
 
 func dbInitialize() {
@@ -140,16 +143,21 @@ func calculatePasshash(accountName, password string) string {
 	return digest(password + ":" + calculateSalt(accountName))
 }
 
-func getSession(r *http.Request) *sessions.Session {
-	session, _ := store.Get(r, "isuconp-go.session")
+func getSession(c *fiber.Ctx) *session.Session {
+	session, err := sessionStore.Get(c)
+	if err != nil {
+		log.Println("getSession", err)
+		panic(err)
+	}
 
 	return session
 }
 
-func getSessionUser(r *http.Request) User {
+func getSessionUser(r *fiber.Ctx) User {
 	session := getSession(r)
-	uid, ok := session.Values["user_id"]
-	if !ok || uid == nil {
+
+	uid := session.Get("user_id")
+	if uid == nil {
 		return User{}
 	}
 
@@ -163,17 +171,19 @@ func getSessionUser(r *http.Request) User {
 	return u
 }
 
-func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
-	session := getSession(r)
-	value, ok := session.Values[key]
+func getFlash(c *fiber.Ctx, key string) string {
+	session := getSession(c)
 
-	if !ok || value == nil {
+	value := session.Get(key)
+
+	if value == nil {
 		return ""
-	} else {
-		delete(session.Values, key)
-		session.Save(r, w)
-		return value.(string)
 	}
+
+	session.Delete(key)
+	session.Save()
+
+	return value.(string)
 }
 
 func getUsersFromDB(userIds []string) ([]User, error) {
@@ -222,7 +232,7 @@ func getUsersFromCache(userIds []string) (map[string]User, error) {
 			}
 
 			key := strconv.Itoa(user.ID)
-			err = memcacheClient.Set(&memcache.Item{
+			err = memcacheClient.Set(&goMemcache.Item{
 				Key:   key,
 				Value: rawUser,
 			})
@@ -327,10 +337,10 @@ func isLogin(u User) bool {
 	return u.ID != 0
 }
 
-func getCSRFToken(r *http.Request) string {
-	session := getSession(r)
-	csrfToken, ok := session.Values["csrf_token"]
-	if !ok {
+func getCSRFToken(c *fiber.Ctx) string {
+	session := getSession(c)
+	csrfToken := session.Get("csrf_token")
+	if csrfToken == nil {
 		return ""
 	}
 	return csrfToken.(string)
@@ -348,83 +358,79 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
-func getInitialize(w http.ResponseWriter, r *http.Request) {
+func getInitialize(c *fiber.Ctx) error {
 	dbInitialize()
-	w.WriteHeader(http.StatusOK)
+	c.Status(http.StatusOK)
+	return nil
 }
 
-func getLogin(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func getLogin(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 
 	if isLogin(me) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
-		Me    User
-		Flash string
-	}{me, getFlash(w, r, "notice")})
+	return c.Render("login", fiber.Map{
+		"Me":    me,
+		"Flash": getFlash(c, "notice"),
+	}, "layout")
 }
 
-func postLogin(w http.ResponseWriter, r *http.Request) {
-	if isLogin(getSessionUser(r)) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+func postLogin(c *fiber.Ctx) error {
+	if isLogin(getSessionUser(c)) {
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
-	u := tryLogin(r.FormValue("account_name"), r.FormValue("password"))
+	u := tryLogin(c.FormValue("account_name"), c.FormValue("password"))
 
+	session := getSession(c)
 	if u != nil {
-		session := getSession(r)
-		session.Values["user_id"] = u.ID
-		session.Values["csrf_token"] = secureRandomStr(16)
-		session.Save(r, w)
+		session.Set("user_id", u.ID)
+		session.Set("csrf_token", secureRandomStr(16))
+		session.Save()
 
-		http.Redirect(w, r, "/", http.StatusFound)
-	} else {
-		session := getSession(r)
-		session.Values["notice"] = "アカウント名かパスワードが間違っています"
-		session.Save(r, w)
-
-		http.Redirect(w, r, "/login", http.StatusFound)
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
+
+	session.Set("notice", "アカウント名かパスワードが間違っています")
+	session.Save()
+
+	c.Redirect("/login", http.StatusFound)
+	return nil
 }
 
-func getRegister(w http.ResponseWriter, r *http.Request) {
-	if isLogin(getSessionUser(r)) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+func getRegister(c *fiber.Ctx) error {
+	if isLogin(getSessionUser(c)) {
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("register.html")),
-	).Execute(w, struct {
-		Me    User
-		Flash string
-	}{User{}, getFlash(w, r, "notice")})
+	return c.Render("register", fiber.Map{
+		"Me":    User{},
+		"Flash": getFlash(c, "notice"),
+	}, "layout")
 }
 
-func postRegister(w http.ResponseWriter, r *http.Request) {
-	if isLogin(getSessionUser(r)) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+func postRegister(c *fiber.Ctx) error {
+	if isLogin(getSessionUser(c)) {
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
-	accountName, password := r.FormValue("account_name"), r.FormValue("password")
+	accountName, password := c.FormValue("account_name"), c.FormValue("password")
 
 	validated := validateUser(accountName, password)
 	if !validated {
-		session := getSession(r)
-		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
-		session.Save(r, w)
+		session := getSession(c)
+		session.Set("notice", "アカウント名は3文字以上、パスワードは6文字以上である必要があります")
+		session.Save()
 
-		http.Redirect(w, r, "/register", http.StatusFound)
-		return
+		c.Redirect("/register", http.StatusFound)
+		return nil
 	}
 
 	exists := 0
@@ -432,90 +438,88 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
 
 	if exists == 1 {
-		session := getSession(r)
-		session.Values["notice"] = "アカウント名がすでに使われています"
-		session.Save(r, w)
+		session := getSession(c)
+		session.Set("notice", "アカウント名がすでに使われています")
+		session.Save()
 
-		http.Redirect(w, r, "/register", http.StatusFound)
-		return
+		c.Redirect("/register", http.StatusFound)
+		return nil
 	}
 
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
 	result, err := db.Exec(query, accountName, calculatePasshash(accountName, password))
 	if err != nil {
+		c.Status(http.StatusInternalServerError)
 		log.Print(err)
-		return
+		return nil
 	}
 
-	session := getSession(r)
+	session := getSession(c)
 	uid, err := result.LastInsertId()
 	if err != nil {
+		c.Status(http.StatusInternalServerError)
 		log.Print(err)
-		return
+		return nil
 	}
-	session.Values["user_id"] = uid
-	session.Values["csrf_token"] = secureRandomStr(16)
-	session.Save(r, w)
+	session.Set("user_id", uid)
+	session.Set("csrf_token", secureRandomStr(16))
+	session.Save()
 
-	http.Redirect(w, r, "/", http.StatusFound)
+	c.Redirect("/", http.StatusFound)
+	return nil
 }
 
-func getLogout(w http.ResponseWriter, r *http.Request) {
-	session := getSession(r)
-	delete(session.Values, "user_id")
-	session.Options = &sessions.Options{MaxAge: -1}
-	session.Save(r, w)
+func getLogout(c *fiber.Ctx) error {
+	session := getSession(c)
+	session.Delete("user_id")
+	session.Regenerate()
+	session.Save()
 
-	http.Redirect(w, r, "/", http.StatusFound)
+	c.Redirect("/", http.StatusFound)
+	return nil
 }
 
-func getIndex(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func getIndex(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 
 	results := []Post{}
 
 	err := db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM posts WHERE user_id IN (SELECT id FROM users WHERE del_flg = 0) ORDER BY created_at DESC LIMIT ?", postsPerPage)
 	if err != nil {
+		c.Status(http.StatusForbidden)
 		log.Print(err)
-		return
+		return nil
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(c), false)
 	if err != nil {
+		c.Status(http.StatusForbidden)
 		log.Print(err)
-		return
+		return nil
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	return c.Render("index", fiber.Map{
+		"Posts":     posts,
+		"Me":        me,
+		"CSRFToken": getCSRFToken(c),
+		"Flash":     getFlash(c, "notice"),
+	}, "layout")
 }
 
-func getAccountName(w http.ResponseWriter, r *http.Request) {
-	accountName := chi.URLParam(r, "accountName")
+func getAccountName(c *fiber.Ctx) error {
+	accountName := c.Params("accountName")
 	user := User{}
 
 	err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
 	if err != nil {
+		c.Status(http.StatusInternalServerError)
 		log.Print(err)
-		return
+		return nil
 	}
 
 	if user.ID == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
+		c.Status(http.StatusNotFound)
+		return nil
 	}
 
 	results := []Post{}
@@ -523,27 +527,27 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(c), false)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	commentCount := 0
 	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	postIDs := []int{}
 	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 	postCount := len(postIDs)
 
@@ -564,148 +568,118 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
 		if err != nil {
 			log.Print(err)
-			return
+			return err
 		}
 	}
 
-	me := getSessionUser(r)
+	me := getSessionUser(c)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
-		Posts          []Post
-		User           User
-		PostCount      int
-		CommentCount   int
-		CommentedCount int
-		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	return c.Render("user", fiber.Map{
+		"Posts":          posts,
+		"User":           user,
+		"PostCount":      postCount,
+		"CommentedCount": commentedCount,
+		"Me":             me,
+	}, "layout")
 }
 
-func getPosts(w http.ResponseWriter, r *http.Request) {
-	m, err := url.ParseQuery(r.URL.RawQuery)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		log.Print(err)
-		return
-	}
-	maxCreatedAt := m.Get("max_created_at")
+func getPosts(c *fiber.Ctx) error {
+	maxCreatedAt := c.Query("max_created_at")
 	if maxCreatedAt == "" {
-		return
+
+		return nil
 	}
 
 	t, err := time.Parse(ISO8601Format, maxCreatedAt)
 	if err != nil {
 		log.Print(err)
-		return
+		return nil
 	}
 
 	results := []Post{}
 	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(c), false)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	if len(posts) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
+		c.Status(http.StatusNotFound)
+		return nil
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	return c.Render("posts", posts)
 }
 
-func getPostsID(w http.ResponseWriter, r *http.Request) {
-	pidStr := chi.URLParam(r, "id")
+func getPostsID(c *fiber.Ctx) error {
+	pidStr := c.Params("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
+		c.Status(http.StatusNotFound)
+		return err
 	}
 
 	results := []Post{}
 	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
+	posts, err := makePosts(results, getCSRFToken(c), true)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	if len(posts) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
+		c.Status(http.StatusNotFound)
+		return errors.New("not found posts")
 	}
 
 	p := posts[0]
 
-	me := getSessionUser(r)
+	me := getSessionUser(c)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
-		Post Post
-		Me   User
-	}{p, me})
+	return c.Render("post_id", fiber.Map{
+		"Post": p,
+		"Me":   me,
+	}, "layout")
 }
 
-func postIndex(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func postIndex(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 	if !isLogin(me) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
+		c.Redirect("/login", http.StatusFound)
+		return nil
 	}
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
+	if c.FormValue("csrf_token") != getCSRFToken(c) {
+		c.Status(http.StatusUnprocessableEntity)
+		return nil
 	}
 
-	file, header, err := r.FormFile("file")
+	file, err := c.FormFile("file")
 	if err != nil {
-		session := getSession(r)
-		session.Values["notice"] = "画像が必須です"
-		session.Save(r, w)
+		session := getSession(c)
+		session.Set("notice", "画像が必須です")
+		session.Save()
 
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
 	mime := ""
 	ext := ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
-		contentType := header.Header["Content-Type"][0]
+		contentType := file.Header.Get("Content-Type")
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
 			ext = "jpg"
@@ -716,28 +690,22 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 			mime = "image/gif"
 			ext = "gif"
 		} else {
-			session := getSession(r)
-			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
-			session.Save(r, w)
+			session := getSession(c)
+			session.Set("notice", "投稿できる画像形式はjpgとpngとgifだけです")
+			session.Save()
 
-			http.Redirect(w, r, "/", http.StatusFound)
-			return
+			c.Redirect("/", http.StatusFound)
+			return nil
 		}
 	}
 
-	filedata, err := io.ReadAll(file)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+	if file.Size > UploadLimit {
+		session := getSession(c)
+		session.Set("notice", "ファイルサイズが大きすぎます")
+		session.Save()
 
-	if len(filedata) > UploadLimit {
-		session := getSession(r)
-		session.Values["notice"] = "ファイルサイズが大きすぎます"
-		session.Save(r, w)
-
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
@@ -745,155 +713,144 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		r.FormValue("body"),
+		c.FormValue("body"),
 	)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	pid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
 	fileName := fmt.Sprintf("../public/image/%d.%v", pid, ext)
-	imageFile, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
+	if err := c.SaveFile(file, fileName); err != nil {
 		log.Print(err)
-		return
-	}
-	defer imageFile.Close()
-
-	bufferedWriter := bufio.NewWriter(imageFile)
-	if _, err = bufferedWriter.Write(filedata); err != nil {
-		log.Print(err)
-		return
+		return err
 	}
 
-	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+	c.Redirect("/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+	return nil
 }
 
-func getImage(w http.ResponseWriter, r *http.Request) {
-	pidStr := chi.URLParam(r, "id")
+func getImage(c *fiber.Ctx) error {
+	pidStr := c.Params("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
+		c.Status(http.StatusNotFound)
+		return nil
 	}
 
 	post := Post{}
 	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	ext := chi.URLParam(r, "ext")
+	ext := c.Params("ext")
 
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+		c.Append("Content-Type", post.Mime)
+		_, err := c.Write(post.Imgdata)
 		if err != nil {
 			log.Print(err)
-			return
+			return err
 		}
-		return
+		return nil
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	c.Status(http.StatusNotFound)
+	return nil
 }
 
-func postComment(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func postComment(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 	if !isLogin(me) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
+		c.Redirect("/login", http.StatusFound)
+		return nil
 	}
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
+	if c.FormValue("csrf_token") != getCSRFToken(c) {
+		c.Status(http.StatusUnprocessableEntity)
+		return nil
 	}
 
-	postID, err := strconv.Atoi(r.FormValue("post_id"))
+	postID, err := strconv.Atoi(c.FormValue("post_id"))
 	if err != nil {
 		log.Print("post_idは整数のみです")
-		return
+		return err
 	}
 
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
+	_, err = db.Exec(query, postID, me.ID, c.FormValue("comment"))
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
+	c.Redirect(fmt.Sprintf("/posts/%d", postID), http.StatusFound)
+	return nil
 }
 
-func getAdminBanned(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func getAdminBanned(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 	if !isLogin(me) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
 	if me.Authority == 0 {
-		w.WriteHeader(http.StatusForbidden)
-		return
+		c.Status(http.StatusForbidden)
+		return nil
 	}
 
 	users := []User{}
 	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
-		return
+		return err
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("banned.html")),
-	).Execute(w, struct {
-		Users     []User
-		Me        User
-		CSRFToken string
-	}{users, me, getCSRFToken(r)})
+	return c.Render("banned", fiber.Map{
+		"Users":     users,
+		"Me":        me,
+		"CSRFToken": getCSRFToken(c),
+	}, "layout")
 }
 
-func postAdminBanned(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+func postAdminBanned(c *fiber.Ctx) error {
+	me := getSessionUser(c)
 	if !isLogin(me) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
+		c.Redirect("/", http.StatusFound)
+		return nil
 	}
 
 	if me.Authority == 0 {
-		w.WriteHeader(http.StatusForbidden)
-		return
+		c.Status(http.StatusForbidden)
+		return nil
 	}
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
+	if c.FormValue("csrf_token") != getCSRFToken(c) {
+		c.Status(http.StatusUnprocessableEntity)
+		return nil
 	}
 
 	query := "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?"
 
-	err := r.ParseForm()
-	if err != nil {
-		log.Print(err)
-		return
-	}
+	uid := c.Query("uid[]")
 
-	for _, id := range r.Form["uid[]"] {
+	for _, id := range strings.Split(uid, ",") {
 		db.Exec(query, 1, id)
 	}
 
-	http.Redirect(w, r, "/admin/banned", http.StatusFound)
+	c.Redirect("/admin/banned", http.StatusFound)
+	return nil
 }
 
 func main() {
@@ -934,26 +891,33 @@ func main() {
 	}
 	defer db.Close()
 
-	r := chi.NewRouter()
+	engine := html.New("./templates", ".html")
+	engine.AddFunc("imageURL", imageURL)
 
-	r.Get("/initialize", getInitialize)
-	r.Get("/login", getLogin)
-	r.Post("/login", postLogin)
-	r.Get("/register", getRegister)
-	r.Post("/register", postRegister)
-	r.Get("/logout", getLogout)
-	r.Get("/", getIndex)
-	r.Get("/posts", getPosts)
-	r.Get("/posts/{id}", getPostsID)
-	r.Post("/", postIndex)
-	r.Get("/image/{id}.{ext}", getImage)
-	r.Post("/comment", postComment)
-	r.Get("/admin/banned", getAdminBanned)
-	r.Post("/admin/banned", postAdminBanned)
-	r.Get(`/@{accountName:[a-zA-Z]+}`, getAccountName)
-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
+	app := fiber.New(fiber.Config{
+		// Prefork:     true,
+		Views: engine,
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	app.Get("/initialize", getInitialize)
+	app.Get("/login", getLogin)
+	app.Post("/login", postLogin)
+	app.Get("/register", getRegister)
+	app.Post("/register", postRegister)
+	app.Get("/logout", getLogout)
+	app.Get("/", getIndex)
+	app.Get("/posts", getPosts)
+	app.Get("/posts/:id", getPostsID)
+	app.Post("/", postIndex)
+	app.Get("/image/:id.:ext", getImage)
+	app.Post("/comment", postComment)
+	app.Get("/admin/banned", getAdminBanned)
+	app.Post("/admin/banned", postAdminBanned)
+	app.Get(`/@:accountName<regex([a-zA-Z]+)>`, getAccountName)
+	app.Static("/css", "../public/css")
+	app.Static("/img", "../public/img")
+	app.Static("/js", "../public/js")
+	app.Static("/favicon.ico", "../public/favicon.ico")
+
+	log.Fatal(app.Listen(":8080"))
 }
