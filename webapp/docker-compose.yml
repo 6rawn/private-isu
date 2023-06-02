@@ -1,8 +1,10 @@
 services:
   nginx:
     image: nginx:1.24
+    command: /opt/run.sh
     volumes:
       - ./etc/nginx/conf.d:/etc/nginx/conf.d
+      - ./etc/nginx/run.sh:/opt/run.sh
       - ./public:/public
       - ./logs/nginx:/var/log/nginx
     ports:
@@ -29,7 +31,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: "1"
           memory: 1g
 
   mysql:
@@ -48,7 +50,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: "1"
           memory: 1g
 
   memcached:
