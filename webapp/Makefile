@@ -10,6 +10,14 @@ down:
 restart:
 	docker compose down; docker compose up -d
 
+.PHONY: build
+build:
+	docker compose build
+
+.PHONY: clean
+clean:
+	docker compose down --rmi all
+
 .PHONY: log
 log:
 	docker compose logs -f
