@@ -1,5 +1,4 @@
 #!/bin/bash
 
-mysql_container=$(docker ps | grep $(docker compose ps | grep mysql | cut -f 1 -d ' ') | cut -f 1 -d ' ')
-docker exec -it $mysql_container mysql -u root -proot -D isuconp
 # mysql --host 127.0.0.1 --port 3306 -u root -proot -D isuconp;
+docker compose exec mysql mysql -u root -proot -D isuconp
