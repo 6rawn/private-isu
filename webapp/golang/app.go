@@ -57,8 +57,8 @@ type Post struct {
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
-	User         User
 	CSRFToken    string
+	User
 }
 
 type Comment struct {
@@ -67,7 +67,7 @@ type Comment struct {
 	UserID    int       `db:"user_id"`
 	Comment   string    `db:"comment"`
 	CreatedAt time.Time `db:"created_at"`
-	User      User
+	User
 }
 
 func init() {
@@ -243,7 +243,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		query := "SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at, u.account_name FROM comments AS c FORCE INDEX (post_id_idx) INNER JOIN users AS u ON c.user_id = u.id WHERE post_id = ? ORDER BY created_at DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
@@ -253,47 +253,14 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
-		postUserId := strconv.Itoa(p.UserID)
-		userIds := []string{postUserId}
-		for i := 0; i < len(comments); i++ {
-			userIds = append(userIds, strconv.Itoa(comments[i].UserID))
-		}
-
-		users, err := getUsers(userIds)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			userId := strconv.Itoa(comments[i].UserID)
-			user, ok := users[userId]
-			if !ok {
-				return nil, fmt.Errorf("no found user %s", userId)
-			}
-			comments[i].User = user
-		}
-
 		// reverse
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
 
 		p.Comments = comments
-
-		u, ok := users[postUserId]
-		if !ok {
-			return nil, err
-		}
-		p.User = u
-
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
@@ -463,7 +430,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM posts WHERE user_id IN (SELECT id FROM users WHERE del_flg = 0) ORDER BY created_at DESC LIMIT ?", postsPerPage)
+	err := db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at, u.account_name FROM posts AS p FORCE INDEX (user_id_idx) INNER JOIN users AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY created_at DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -509,7 +476,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at, u.account_name FROM posts AS p FORCE INDEX (user_id_idx) INNER JOIN users AS u ON p.user_id = u.id WHERE p.user_id = ? ORDER BY created_at DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -597,7 +564,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at, u.account_name FROM posts AS p FORCE INDEX (user_id_idx) INNER JOIN users AS u ON p.user_id = u.id WHERE p.created_at <= ? ORDER BY created_at DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -633,7 +600,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at, u.account_name FROM posts AS p FORCE INDEX (user_id_idx) INNER JOIN users AS u ON p.user_id = u.id WHERE p.id = ? LIMIT 1", pid)
 	if err != nil {
 		log.Print(err)
 		return
