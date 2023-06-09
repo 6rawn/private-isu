@@ -32,7 +32,7 @@ reset-logs:
 .PHONY: alp
 alp:
 	# ./alp json --file logs/nginx/access.log 
-	./alp json --file logs/nginx/access.log -o count,method,uri,min,avg,max
+	./alp json --file logs/nginx/access.log -m "/posts/[0-9]+,/@\w+,/image/[0-9]+" -o count,method,uri,min,avg,max
 
 .PHONY: ab
 ab:
