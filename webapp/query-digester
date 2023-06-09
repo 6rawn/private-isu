@@ -1,8 +1,8 @@
 #!/bin/bash
 
 TMP_SLOW_QUERY_LOG=/var/log/mysql/slow_query_$(date +%Y%m%d%H%M).digest
-echo "Write latest sloq_query_log to ${TMP_SLOW_QUERY_LOG} from now during 40s."
+echo "Write latest sloq_query_log to ${TMP_SLOW_QUERY_LOG} from now during 90s."
 docker compose exec -it mysql mysql -u root -proot -e 'SET GLOBAL slow_query_log_file = "'${TMP_SLOW_QUERY_LOG}'"'
-sleep 40
+sleep 90
 docker compose exec -it mysql mysql -u root -proot -e 'SET GLOBAL slow_query_log_file = "/var/log/mysql/mysql-slow.log"'
 echo "Finished!"
