@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -234,14 +235,63 @@ func getUsers(userIds []string) (map[string]User, error) {
 	return users, nil
 }
 
+func getCommentCountFromDB(postId int) (*int, error) {
+	var count int
+	err := db.Get(&count, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", postId)
+	if err != nil {
+		return nil, err
+	}
+	return &count, nil
+}
+
+func getCommentCountFromCache(postId int) (*int, error) {
+	key := fmt.Sprintf("comments_count_%d", postId)
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		if !errors.Is(err, memcache.ErrCacheMiss) {
+			return nil, err
+		}
+
+		count, err := getCommentCountFromDB(postId)
+		if err != nil {
+			return nil, err
+		}
+
+		rawCount, err := json.Marshal(*count)
+		if err != nil {
+			return nil, err
+		}
+
+		err = memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      rawCount,
+			Expiration: int32((60 * time.Second).Seconds()),
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return count, nil
+	}
+
+	var count int
+	err = json.Unmarshal(item.Value, &count)
+	if err != nil {
+		return nil, err
+	}
+
+	return &count, nil
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		count, err := getCommentCountFromCache(p.ID)
 		if err != nil {
 			return nil, err
 		}
+		p.CommentCount = *count
 
 		query := "SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at, u.account_name FROM comments AS c FORCE INDEX (post_id_idx) INNER JOIN users AS u ON c.user_id = u.id WHERE post_id = ? ORDER BY created_at DESC"
 		if !allComments {
