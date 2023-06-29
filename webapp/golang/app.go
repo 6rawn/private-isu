@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	goMemcache "github.com/bradfitz/gomemcache/memcache"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
@@ -64,6 +65,11 @@ type Comment struct {
 	Comment   string    `db:"comment"`
 	CreatedAt time.Time `db:"created_at"`
 	User      User
+}
+
+type CommentCounts struct {
+	PostID int `db:"post_id"`
+	Count  int `db:"count"`
 }
 
 func init() {
@@ -255,66 +261,173 @@ func getUsers(userIds []string) (map[string]User, error) {
 	return users, nil
 }
 
+func getCommentCountsFromDB(postIds []string) ([]CommentCounts, error) {
+	var commentCounts []CommentCounts
+	query := fmt.Sprintf("SELECT post_id, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (%s) GROUP BY post_id", strings.Join(postIds, ", "))
+	err := db.Select(&commentCounts, query)
+	if err != nil {
+		return nil, err
+	}
+	return commentCounts, nil
+}
+
+func getCommentCountsFromCache(postIds []int) (map[int]int, error) {
+	keys := []string{}
+
+	for _, postId := range postIds {
+		keys = append(keys, fmt.Sprintf("comments_count_%d", postId))
+	}
+
+	items, err := memcacheClient.GetMulti(keys)
+	if err != nil {
+		return nil, err
+	}
+
+	counts := map[int]int{}
+	notFoundPostIds := []string{}
+	for index, postId := range postIds {
+		item, ok := items[keys[index]]
+		if !ok {
+			notFoundPostIds = append(notFoundPostIds, strconv.Itoa(postId))
+			continue
+		}
+
+		var count int
+		if err := json.Unmarshal(item.Value, &count); err != nil {
+			return nil, err
+		}
+
+		counts[postId] = count
+	}
+
+	if len(notFoundPostIds) > 0 {
+		comments, err := getCommentCountsFromDB(notFoundPostIds)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, comment := range comments {
+			rawComment, err := json.Marshal(comment.Count)
+			if err != nil {
+				return nil, err
+			}
+
+			err = memcacheClient.Set(&memcache.Item{
+				Key:   fmt.Sprintf("comments_count_%d", comment.PostID),
+				Value: rawComment,
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			counts[comment.PostID] = comment.Count
+		}
+	}
+
+	return counts, nil
+}
+
+func getCommentsFromDB(postId int, allComments bool) ([]Comment, error) {
+	query := "SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at, u.account_name FROM comments AS c FORCE INDEX (post_id_idx) INNER JOIN users AS u ON c.user_id = u.id WHERE post_id = ? ORDER BY created_at DESC"
+	if !allComments {
+		query += " LIMIT 3"
+	}
+
+	var comments []Comment
+	err := db.Select(&comments, query, postId)
+	if err != nil {
+		return nil, err
+	}
+
+	// reverse
+	for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+		comments[i], comments[j] = comments[j], comments[i]
+	}
+
+	return comments, nil
+}
+
+func getCommentsFromCache(postIds []int, allComments bool) (map[int][]Comment, error) {
+	suffix := "limited"
+	if allComments {
+		suffix = "all"
+	}
+
+	keys := []string{}
+	for _, postId := range postIds {
+		keys = append(keys, fmt.Sprintf("comments_%d_%s", postId, suffix))
+	}
+
+	items, err := memcacheClient.GetMulti(keys)
+	if err != nil {
+		return nil, err
+	}
+
+	comments := map[int][]Comment{}
+	notFoundPostIds := []int{}
+	for index, postId := range postIds {
+		rawComment, ok := items[keys[index]]
+		if !ok {
+			notFoundPostIds = append(notFoundPostIds, postId)
+			continue
+		}
+
+		var cc []Comment
+		if err := json.Unmarshal(rawComment.Value, &cc); err != nil {
+			return nil, err
+		}
+
+		comments[postId] = cc
+	}
+
+	for _, postId := range notFoundPostIds {
+		cc, err := getCommentsFromDB(postId, allComments)
+		if err != nil {
+			return nil, err
+		}
+
+		rowCc, err := json.Marshal(cc)
+		if err != nil {
+			return nil, err
+		}
+
+		err = memcacheClient.Set(&memcache.Item{
+			Key:   fmt.Sprintf("comments_%d_%s", postId, suffix),
+			Value: rowCc,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		comments[postId] = cc
+	}
+
+	return comments, nil
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
+	postIds := []int{}
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+		postIds = append(postIds, p.ID)
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
+	counts, err := getCommentCountsFromCache(postIds)
+	if err != nil {
+		return nil, err
+	}
 
-		postUserId := strconv.Itoa(p.UserID)
-		userIds := []string{postUserId}
-		for i := 0; i < len(comments); i++ {
-			userIds = append(userIds, strconv.Itoa(comments[i].UserID))
-		}
+	comments, err := getCommentsFromCache(postIds, allComments)
+	if err != nil {
+		return nil, err
+	}
 
-		users, err := getUsers(userIds)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			userId := strconv.Itoa(comments[i].UserID)
-			user, ok := users[userId]
-			if !ok {
-				return nil, fmt.Errorf("no found user %s", userId)
-			}
-			comments[i].User = user
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		u, ok := users[postUserId]
-		if !ok {
-			return nil, err
-		}
-		p.User = u
-
+	for _, p := range results {
+		p.CommentCount = counts[p.ID]
+		p.Comments = comments[p.ID]
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
